@@ -1,6 +1,0 @@
-** Video to Positions **
-More accurate but heavier -> MMPose / RTMPose
-Standart -> MediaPipe Holistic
-
-** Architecture **
-Pos->FFN->Encoder->decoder (whisper typa shit)

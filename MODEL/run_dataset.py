@@ -4,8 +4,9 @@ import mediapipe as mp
 import json
 import os
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-def extract_landmarks(video_path, sample_delay=0.15):
+def extract_landmarks(video_path):
     """Extracts MediaPipe landmarks and returns them as a list of frames."""
     mp_holistic = mp.solutions.holistic
     cap = cv2.VideoCapture(video_path)
@@ -15,14 +16,14 @@ def extract_landmarks(video_path, sample_delay=0.15):
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps == 0: fps = 30
-    frame_step = max(1, round(fps * sample_delay))
 
     frames_list = []
 
-    # Using model_complexity=1 for faster processing on MacBook Air
+    # CHANGED: model_complexity=1 as per your comment. 
+    # 2 is the most accurate but extremely slow. 1 is the sweet spot for speed.
     with mp_holistic.Holistic(
         static_image_mode=False,
-        model_complexity=2,
+        model_complexity=2, 
         refine_face_landmarks=True) as holistic:
 
         frame_idx = 0
@@ -31,38 +32,61 @@ def extract_landmarks(video_path, sample_delay=0.15):
             success, frame = cap.read()
             if not success: break
 
-            if frame_idx % frame_step == 0:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = holistic.process(frame_rgb)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = holistic.process(frame_rgb)
 
-                def get_coords(landmarks):
-                    if not landmarks: return None
-                    return [{"x": round(l.x, 4), "y": round(l.y, 4), "z": round(l.z, 4)} for l in landmarks.landmark]
+            def get_coords(landmarks):
+                if not landmarks: return None
+                return [{"x": round(l.x, 4), "y": round(l.y, 4), "z": round(l.z, 4)} for l in landmarks.landmark]
 
-                frame_data = {
-                    "frame_idx": frame_idx,
-                    "timestamp_sec": round(frame_idx / fps, 3),
-                    "face": get_coords(results.face_landmarks),
-                    "pose": get_coords(results.pose_landmarks),
-                    "hand1": get_coords(results.right_hand_landmarks),
-                    "hand2": get_coords(results.left_hand_landmarks)
-                }
+            frame_data = {
+                "frame_idx": frame_idx,
+                "timestamp_sec": round(frame_idx / fps, 3),
+                "face": get_coords(results.face_landmarks),
+                "pose": get_coords(results.pose_landmarks),
+                "hand1": get_coords(results.right_hand_landmarks),
+                "hand2": get_coords(results.left_hand_landmarks)
+            }
 
-                frames_list.append(frame_data)
+            frames_list.append(frame_data)
 
             frame_idx += 1
 
     cap.release()
     return frames_list
 
+def process_video_task(row_data):
+    """Worker function to process a single video in a separate CPU process."""
+    att_id, text, _, high, width, length, train = row_data
+    folder = "dataset/train/" if train else "dataset/test/"
+    path = f"{folder}{att_id}.mp4"
+    
+    try:
+        extracted_frames = extract_landmarks(path)
+        
+        if extracted_frames is None:
+            return {"error": "Could not open video", "att_id": att_id}
+            
+        video_record = {
+            "attachment_id": att_id,
+            "text": text,
+            "length": length,
+            "frames": extracted_frames
+        }
+        
+        # Return the parsed data to the main thread
+        return {"record": video_record, "is_train": train, "att_id": att_id, "error": None}
+        
+    except Exception as e:
+        return {"error": str(e), "att_id": att_id}
+
 
 if __name__ == "__main__":
     # 1. Configuration
-    csv_path = "../DATASET/annotations.csv"
-    train_out = "../DATASET/final_train.jsonl"
-    test_out = "../DATASET/final_test.jsonl"
+    csv_path = "dataset/annotations.csv"
+    train_out = "train.jsonl"
+    test_out = "test.jsonl"
 
-    # Optional: Delete existing output files so you don't duplicate data if restarting
     if os.path.exists(train_out): os.remove(train_out)
     if os.path.exists(test_out): os.remove(test_out)
 
@@ -71,33 +95,34 @@ if __name__ == "__main__":
     annotations = pd.read_csv(csv_path, sep='\t')
     print(f"Total videos to process: {len(annotations)}")
 
-    # 3. Process each video with a progress bar
-    for [att_id, text, _, high, width, length, train] in tqdm(annotations.values, desc="Processing Videos"):
-        folder = "train/" if train else "test/"
-        path = f"../DATASET/{folder}{att_id}.mp4"
+    # 3. Determine CPU Cores (Leave 1 core free so your computer doesn't freeze)
+    max_workers = 8
+    print(f"Spinning up {max_workers} parallel workers...")
+
+    # Open file handlers once in the main thread
+    train_file = open(train_out, 'a', encoding='utf-8')
+    test_file = open(test_out, 'a', encoding='utf-8')
+
+    # 4. Process videos in parallel
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all rows to the worker pool
+        futures = {executor.submit(process_video_task, row): row for row in annotations.values}
         
-        try:
-            # Get the list of frames for this video
-            extracted_frames = extract_landmarks(path, sample_delay=0.15)
+        # as_completed yields results as soon as any worker finishes a video
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing Videos"):
+            result = future.result()
             
-            if extracted_frames is None:
-                print(f"Skipped {att_id} (Could not open video)")
+            # Handle Errors
+            if result.get("error"):
+                # tqdm.write prevents the print statement from breaking the visual progress bar
+                tqdm.write(f"Skipped {result['att_id']}: {result['error']}")
                 continue
                 
-            # Create the final video-level dictionary
-            video_record = {
-                "attachment_id": att_id,
-                "text": text,           # The Russian Label
-                "length": length,
-                "frames": extracted_frames
-            }
-            
-            # Route to the correct file based on the 'train' boolean
-            target_file = train_out if train else test_out
-            
-            # Append safely
-            with open(target_file, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(video_record, ensure_ascii=False) + '\n')
-                
-        except Exception as e:
-            print(f"Error processing {att_id}: {e}")
+            # Handle Success: Write to the correct file
+            target_file = train_file if result["is_train"] else test_file
+            target_file.write(json.dumps(result["record"], ensure_ascii=False) + '\n')
+
+    # Clean up file handlers
+    train_file.close()
+    test_file.close()
+    print("Batch processing complete!")
